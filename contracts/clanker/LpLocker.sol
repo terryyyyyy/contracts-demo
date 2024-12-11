@@ -248,6 +248,7 @@ contract LpLocker is Ownable, IERC721Receiver {
             );
         }
     }
+
     /**
      * Checks the vesting schedule for the token
      */
