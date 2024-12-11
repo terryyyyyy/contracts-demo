@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.25;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
@@ -9,23 +9,53 @@ import {INonfungiblePositionManager, IUniswapV3Factory, ILockerFactory, ILocker,
 import {Bytes32AddressLib} from "./Bytes32AddressLib.sol";
 
 contract Token is ERC20 {
+    string private _name;
+    string private _symbol;
+    uint8 private immutable _decimals;
+
+    address private _deployer;
+    uint256 private _fid;
+    string private _image;
+    string private _castHash;
+
     constructor(
         string memory name_,
         string memory symbol_,
-        uint256 maxSupply_
+        uint256 maxSupply_,
+        address deployer_,
+        uint256 fid_,
+        string memory image_,
+        string memory castHash_
     ) ERC20(name_, symbol_) {
+        _deployer = deployer_;
+        _fid = fid_;
+        _image = image_;
+        _castHash = castHash_;
         _mint(msg.sender, maxSupply_);
     }
 
-    function decimals() public view virtual override returns (uint8) {
-        return 18;
+    function fid() public view returns (uint256) {
+        return _fid;
+    }
+
+    function deployer() public view returns (address) {
+        return _deployer;
+    }
+
+    function image() public view returns (string memory) {
+        return _image;
+    }
+
+    function castHash() public view returns (string memory) {
+        return _castHash;
     }
 }
 
-// 0x250c9FB2b411B48273f69879007803790A6AeA47
-contract SocialDexDeployer is Ownable {
+contract Clanker is Ownable {
     using TickMath for int24;
     using Bytes32AddressLib for bytes32;
+
+    error Deprecated();
 
     address public taxCollector;
     uint64 public defaultLockingPeriod = 33275115461;
@@ -39,15 +69,19 @@ contract SocialDexDeployer is Ownable {
     INonfungiblePositionManager public positionManager;
     address public swapRouter;
 
+    bool public deprecated;
+    bool public bundleFeeSwitch;
+
     event TokenCreated(
         address tokenAddress,
         uint256 lpNftId,
         address deployer,
+        uint256 fid,
         string name,
         string symbol,
         uint256 supply,
-        uint256 _supply,
-        address lockerAddress
+        address lockerAddress,
+        string castHash
     );
 
     constructor(
@@ -57,8 +91,9 @@ contract SocialDexDeployer is Ownable {
         address uniswapV3Factory_,
         address positionManager_,
         uint64 defaultLockingPeriod_,
-        address swapRouter_
-    ) Ownable(msg.sender) {
+        address swapRouter_,
+        address owner_
+    ) Ownable(owner_) {
         taxCollector = taxCollector_;
         weth = weth_;
         liquidityLocker = ILockerFactory(locker_);
@@ -75,8 +110,13 @@ contract SocialDexDeployer is Ownable {
         int24 _initialTick,
         uint24 _fee,
         bytes32 _salt,
-        address _deployer
-    ) external payable returns (Token token, uint256 tokenId) {
+        address _deployer,
+        uint256 _fid,
+        string memory _image,
+        string memory _castHash
+    ) external payable onlyOwner returns (Token token, uint256 tokenId) {
+        if (deprecated) revert Deprecated();
+
         int24 tickSpacing = uniswapV3Factory.feeAmountTickSpacing(_fee);
 
         require(
@@ -84,14 +124,19 @@ contract SocialDexDeployer is Ownable {
             "Invalid tick"
         );
 
-        token = new Token{salt: keccak256(abi.encode(msg.sender, _salt))}(
+        token = new Token{salt: keccak256(abi.encode(_deployer, _salt))}(
             _name,
             _symbol,
-            _supply
+            _supply,
+            _deployer,
+            _fid,
+            _image,
+            _castHash
         );
 
+        // Makes sure that the token address is less than the WETH address. This is so that the token
+        // is first in the pool. Just makes things consistent.
         require(address(token) < weth, "Invalid salt");
-        require(_supply >= _supply, "Invalid supply amount");
 
         uint160 sqrtPriceX96 = _initialTick.getSqrtRatioAtTick();
         address pool = uniswapV3Factory.createPool(address(token), weth, _fee);
@@ -127,19 +172,28 @@ contract SocialDexDeployer is Ownable {
 
         ILocker(lockerAddress).initializer(tokenId);
 
-        uint256 protocolFees = (msg.value * protocolCut) / 1000;
-        uint256 remainingFundsToBuyTokens = msg.value - protocolFees;
-
-        // send to 0x04F6ef12a8B6c2346C8505eE4Cff71C43D2dd825
-
         if (msg.value > 0) {
+            uint256 remainingFundsToBuyTokens = msg.value;
+            if (bundleFeeSwitch) {
+                uint256 protocolFees = (msg.value * taxRate) / 1000;
+                remainingFundsToBuyTokens = msg.value - protocolFees;
+
+                (bool success, ) = payable(taxCollector).call{
+                    value: protocolFees
+                }("");
+
+                if (!success) {
+                    revert("Failed to send protocol fees");
+                }
+            }
+
             ExactInputSingleParams memory swapParams = ExactInputSingleParams({
                 tokenIn: weth, // The token we are exchanging from (ETH wrapped as WETH)
                 tokenOut: address(token), // The token we are exchanging to
                 fee: _fee, // The pool fee
-                recipient: msg.sender, // The recipient address
+                recipient: _deployer, // The recipient address
                 amountIn: remainingFundsToBuyTokens, // The amount of ETH (WETH) to be swapped
-                amountOutMinimum: 0, // Minimum amount of DAI to receive
+                amountOutMinimum: 0, // Minimum amount to receive
                 sqrtPriceLimitX96: 0 // No price limit
             });
 
@@ -149,21 +203,16 @@ contract SocialDexDeployer is Ownable {
             }(swapParams);
         }
 
-        (bool success, ) = payable(taxCollector).call{value: protocolFees}("");
-
-        if (!success) {
-            revert("Failed to send protocol fees");
-        }
-
         emit TokenCreated(
             address(token),
             tokenId,
-            msg.sender,
+            _deployer,
+            _fid,
             _name,
             _symbol,
             _supply,
-            _supply,
-            lockerAddress
+            lockerAddress,
+            _castHash
         );
     }
 
@@ -184,8 +233,11 @@ contract SocialDexDeployer is Ownable {
 
     function predictToken(
         address deployer,
+        uint256 fid,
         string calldata name,
         string calldata symbol,
+        string calldata image,
+        string calldata castHash,
         uint256 supply,
         bytes32 salt
     ) public view returns (address) {
@@ -199,7 +251,15 @@ contract SocialDexDeployer is Ownable {
                     keccak256(
                         abi.encodePacked(
                             type(Token).creationCode,
-                            abi.encode(name, symbol, supply)
+                            abi.encode(
+                                name,
+                                symbol,
+                                supply,
+                                deployer,
+                                fid,
+                                image,
+                                castHash
+                            )
                         )
                     )
                 )
@@ -208,17 +268,37 @@ contract SocialDexDeployer is Ownable {
 
     function generateSalt(
         address deployer,
+        uint256 fid,
         string calldata name,
         string calldata symbol,
+        string calldata image,
+        string calldata castHash,
         uint256 supply
     ) external view returns (bytes32 salt, address token) {
         for (uint256 i; ; i++) {
             salt = bytes32(i);
-            token = predictToken(deployer, name, symbol, supply, salt);
+            token = predictToken(
+                deployer,
+                fid,
+                name,
+                symbol,
+                image,
+                castHash,
+                supply,
+                salt
+            );
             if (token < weth && token.code.length == 0) {
                 break;
             }
         }
+    }
+
+    function toggleBundleFeeSwitch(bool _enabled) external onlyOwner {
+        bundleFeeSwitch = _enabled;
+    }
+
+    function setDeprecated(bool _deprecated) external onlyOwner {
+        deprecated = _deprecated;
     }
 
     function updateTaxCollector(address newCollector) external onlyOwner {
